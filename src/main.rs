@@ -20,7 +20,7 @@ const SCORES_FILE: &str = ".tetris_scores";
 const SCORES_KEEP: usize = 10;
 const NEXT_PREVIEW: usize = 5;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum Piece {
     I,
     O,
@@ -33,7 +33,15 @@ enum Piece {
 
 impl Piece {
     fn all() -> [Piece; 7] {
-        [Piece::I, Piece::O, Piece::T, Piece::S, Piece::Z, Piece::J, Piece::L]
+        [
+            Piece::I,
+            Piece::O,
+            Piece::T,
+            Piece::S,
+            Piece::Z,
+            Piece::J,
+            Piece::L,
+        ]
     }
 
     fn color(self) -> Color {
@@ -89,6 +97,48 @@ impl Piece {
                 _ => [(0, 0), (0, 1), (1, 1), (2, 1)],
             },
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TSpinType {
+    None,
+    Mini,
+    Full,
+}
+
+// SRS wall-kick offsets in (dr, dc), already converted from canonical (x, y_up).
+// The first entry is always the no-kick test.
+fn srs_kicks(piece: Piece, from: usize, to: usize) -> [(i32, i32); 5] {
+    let f = from & 3;
+    let t = to & 3;
+    if piece == Piece::O {
+        return [(0, 0); 5];
+    }
+    if piece == Piece::I {
+        return match (f, t) {
+            (0, 1) => [(0, 0), (0, -2), (0, 1), (1, -2), (-2, 1)],
+            (1, 0) => [(0, 0), (0, 2), (0, -1), (-1, 2), (2, -1)],
+            (1, 2) => [(0, 0), (0, -1), (0, 2), (-2, -1), (1, 2)],
+            (2, 1) => [(0, 0), (0, 1), (0, -2), (2, 1), (-1, -2)],
+            (2, 3) => [(0, 0), (0, 2), (0, -1), (-1, 2), (2, -1)],
+            (3, 2) => [(0, 0), (0, -2), (0, 1), (1, -2), (-2, 1)],
+            (3, 0) => [(0, 0), (0, 1), (0, -2), (2, 1), (-1, -2)],
+            (0, 3) => [(0, 0), (0, -1), (0, 2), (-2, -1), (1, 2)],
+            _ => [(0, 0); 5],
+        };
+    }
+    // J, L, S, T, Z
+    match (f, t) {
+        (0, 1) => [(0, 0), (0, -1), (-1, -1), (2, 0), (2, -1)],
+        (1, 0) => [(0, 0), (0, 1), (1, 1), (-2, 0), (-2, 1)],
+        (1, 2) => [(0, 0), (0, 1), (1, 1), (-2, 0), (-2, 1)],
+        (2, 1) => [(0, 0), (0, -1), (-1, -1), (2, 0), (2, -1)],
+        (2, 3) => [(0, 0), (0, 1), (-1, 1), (2, 0), (2, 1)],
+        (3, 2) => [(0, 0), (0, -1), (1, -1), (-2, 0), (-2, -1)],
+        (3, 0) => [(0, 0), (0, -1), (1, -1), (-2, 0), (-2, -1)],
+        (0, 3) => [(0, 0), (0, 1), (-1, 1), (2, 0), (2, 1)],
+        _ => [(0, 0); 5],
     }
 }
 
@@ -187,6 +237,9 @@ struct Game {
     game_over: bool,
     paused: bool,
     score_saved: bool,
+    last_was_rotation: bool,
+    last_clear_text: Option<String>,
+    last_clear_at: Option<Instant>,
 }
 
 impl Game {
@@ -195,7 +248,12 @@ impl Game {
         let piece = bag.next();
         Game {
             board: [[None; WIDTH]; HEIGHT],
-            active: Active { piece, rot: 0, row: 0, col: 3 },
+            active: Active {
+                piece,
+                rot: 0,
+                row: 0,
+                col: 3,
+            },
             bag,
             hold: None,
             hold_used: false,
@@ -208,6 +266,9 @@ impl Game {
             game_over: false,
             paused: false,
             score_saved: false,
+            last_was_rotation: false,
+            last_clear_text: None,
+            last_clear_at: None,
         }
     }
 
@@ -257,6 +318,7 @@ impl Game {
         if !self.collides(&new_cells) {
             self.active.row += dr;
             self.active.col += dc;
+            self.last_was_rotation = false;
             // Lateral moves (dr == 0) count as resettable actions; downward gravity does not.
             self.after_move(dr == 0);
             true
@@ -266,16 +328,18 @@ impl Game {
     }
 
     fn try_rotate(&mut self, dir: i32) -> bool {
-        let new_rot = ((self.active.rot as i32 + dir).rem_euclid(4)) as usize;
-        let kicks: [(i32, i32); 5] = [(0, 0), (0, -1), (0, 1), (0, -2), (0, 2)];
+        let from = self.active.rot;
+        let to = ((from as i32 + dir).rem_euclid(4)) as usize;
+        let kicks = srs_kicks(self.active.piece, from, to);
         for k in kicks {
-            let cells =
-                self.active
-                    .cells_with(new_rot, self.active.row + k.0, self.active.col + k.1);
+            let cells = self
+                .active
+                .cells_with(to, self.active.row + k.0, self.active.col + k.1);
             if !self.collides(&cells) {
-                self.active.rot = new_rot;
+                self.active.rot = to;
                 self.active.row += k.0;
                 self.active.col += k.1;
+                self.last_was_rotation = true;
                 self.after_move(true);
                 return true;
             }
@@ -283,21 +347,64 @@ impl Game {
         false
     }
 
+    // Standard guideline T-spin detection.
+    // Requires the T-piece to be locked immediately after a successful rotation.
+    // Counts 4 diagonal corners around the T's center cell.
+    // - Full T-spin: both "back" corners filled (and >=3 total).
+    // - Mini T-spin: only one back corner filled, but both front corners filled (>=3 total).
+    fn detect_tspin(&self) -> TSpinType {
+        if !self.last_was_rotation || self.active.piece != Piece::T {
+            return TSpinType::None;
+        }
+        // Corners of 3x3 box around center (1, 1) of the shape.
+        let corners = [(0i32, 0i32), (0, 2), (2, 0), (2, 2)];
+        let mut filled = [false; 4];
+        for (i, (dr, dc)) in corners.iter().enumerate() {
+            let r = self.active.row + dr;
+            let c = self.active.col + dc;
+            let out_of_bounds = c < 0 || c >= WIDTH as i32 || r >= HEIGHT as i32;
+            let on_board = r >= 0 && !out_of_bounds && self.board[r as usize][c as usize].is_some();
+            filled[i] = out_of_bounds || on_board;
+        }
+        let count = filled.iter().filter(|&&b| b).count();
+        if count < 3 {
+            return TSpinType::None;
+        }
+        // Front (pointy side) and back (flat side) corner indices into `corners`.
+        let (front, back): ([usize; 2], [usize; 2]) = match self.active.rot {
+            0 => ([0, 1], [2, 3]),
+            1 => ([1, 3], [0, 2]),
+            2 => ([2, 3], [0, 1]),
+            _ => ([0, 2], [1, 3]),
+        };
+        let back_filled = back.iter().all(|&i| filled[i]);
+        let front_filled = front.iter().all(|&i| filled[i]);
+        if back_filled {
+            TSpinType::Full
+        } else if front_filled {
+            TSpinType::Mini
+        } else {
+            TSpinType::None
+        }
+    }
+
     fn lock_piece(&mut self) {
+        let tspin = self.detect_tspin();
         let color = self.active.piece.color();
         for (r, c) in self.active.cells() {
             if r >= 0 && r < HEIGHT as i32 && c >= 0 && c < WIDTH as i32 {
                 self.board[r as usize][c as usize] = Some(color);
             }
         }
-        self.clear_lines();
+        let cleared = self.clear_full_lines();
+        self.apply_score(tspin, cleared);
         self.lock_timer = None;
         self.lock_resets = 0;
         self.hold_used = false;
         self.spawn_next();
     }
 
-    fn clear_lines(&mut self) {
+    fn clear_full_lines(&mut self) -> u32 {
         let mut cleared = 0u32;
         let mut new_board: [[Option<Color>; WIDTH]; HEIGHT] = [[None; WIDTH]; HEIGHT];
         let mut new_row = HEIGHT as i32 - 1;
@@ -311,22 +418,46 @@ impl Game {
             }
         }
         self.board = new_board;
-        if cleared > 0 {
-            self.lines += cleared;
-            let points = match cleared {
-                1 => 100,
-                2 => 300,
-                3 => 500,
-                _ => 800,
-            };
+        cleared
+    }
+
+    fn apply_score(&mut self, tspin: TSpinType, cleared: u32) {
+        self.lines += cleared;
+        let (points, label): (u32, Option<&'static str>) = match (tspin, cleared) {
+            (TSpinType::Full, 0) => (400, Some("T-SPIN")),
+            (TSpinType::Full, 1) => (800, Some("T-SPIN SINGLE")),
+            (TSpinType::Full, 2) => (1200, Some("T-SPIN DOUBLE")),
+            (TSpinType::Full, 3) => (1600, Some("T-SPIN TRIPLE")),
+            (TSpinType::Mini, 0) => (100, Some("T-SPIN MINI")),
+            (TSpinType::Mini, 1) => (200, Some("T-SPIN MINI SINGLE")),
+            (TSpinType::Mini, 2) => (400, Some("T-SPIN MINI DOUBLE")),
+            (TSpinType::None, 1) => (100, Some("SINGLE")),
+            (TSpinType::None, 2) => (300, Some("DOUBLE")),
+            (TSpinType::None, 3) => (500, Some("TRIPLE")),
+            (TSpinType::None, 4) => (800, Some("TETRIS")),
+            _ => (0, None),
+        };
+        if points > 0 {
             self.score += points * self.level;
+        }
+        if let Some(text) = label {
+            self.last_clear_text = Some(text.to_string());
+            self.last_clear_at = Some(Instant::now());
+        }
+        if cleared > 0 {
             self.level = 1 + self.lines / 10;
         }
     }
 
     fn spawn_next(&mut self) {
         let piece = self.bag.next();
-        self.active = Active { piece, rot: 0, row: 0, col: 3 };
+        self.active = Active {
+            piece,
+            rot: 0,
+            row: 0,
+            col: 3,
+        };
+        self.last_was_rotation = false;
         if self.collides(&self.active.cells()) {
             self.game_over = true;
         } else {
@@ -374,9 +505,15 @@ impl Game {
         };
         self.hold = Some(cur);
         self.hold_used = true;
-        self.active = Active { piece: new_piece, rot: 0, row: 0, col: 3 };
+        self.active = Active {
+            piece: new_piece,
+            rot: 0,
+            row: 0,
+            col: 3,
+        };
         self.lock_timer = None;
         self.lock_resets = 0;
+        self.last_was_rotation = false;
         if self.collides(&self.active.cells()) {
             self.game_over = true;
         } else {
@@ -387,7 +524,9 @@ impl Game {
     fn ghost_row(&self) -> i32 {
         let mut r = self.active.row;
         loop {
-            let cells = self.active.cells_with(self.active.rot, r + 1, self.active.col);
+            let cells = self
+                .active
+                .cells_with(self.active.rot, r + 1, self.active.col);
             if self.collides(&cells) {
                 return r;
             }
@@ -466,11 +605,17 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
     queue!(out, Print("┐"))?;
 
     let ghost_r = game.ghost_row();
-    let ghost_cells = game.active.cells_with(game.active.rot, ghost_r, game.active.col);
+    let ghost_cells = game
+        .active
+        .cells_with(game.active.rot, ghost_r, game.active.col);
     let active_cells = game.active.cells();
 
     for r in 0..HEIGHT {
-        queue!(out, cursor::MoveTo(board_x - 1, board_y + r as u16), Print("│"))?;
+        queue!(
+            out,
+            cursor::MoveTo(board_x - 1, board_y + r as u16),
+            Print("│")
+        )?;
         queue!(out, cursor::MoveTo(board_x, board_y + r as u16))?;
         for c in 0..WIDTH {
             let cell_color: Option<Color> = game.board[r][c];
@@ -591,6 +736,21 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
         ResetColor
     )?;
 
+    // Flash text for T-spin / Tetris etc. (1500ms fade)
+    if let (Some(text), Some(t)) = (game.last_clear_text.as_ref(), game.last_clear_at) {
+        if t.elapsed() < Duration::from_millis(1500) {
+            let len = text.chars().count() as u16;
+            let cx = board_x + (WIDTH as u16) - len.min(WIDTH as u16 * 2) / 2;
+            queue!(
+                out,
+                cursor::MoveTo(cx, board_y + (HEIGHT as u16) / 2 - 2),
+                SetForegroundColor(Color::Magenta),
+                Print(text),
+                ResetColor
+            )?;
+        }
+    }
+
     if game.paused {
         queue!(
             out,
@@ -608,7 +768,10 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
             SetForegroundColor(Color::Red),
             Print(" GAME OVER "),
             ResetColor,
-            cursor::MoveTo(board_x + (WIDTH as u16) - 9, board_y + (HEIGHT as u16) / 2 + 1),
+            cursor::MoveTo(
+                board_x + (WIDTH as u16) - 9,
+                board_y + (HEIGHT as u16) / 2 + 1
+            ),
             SetForegroundColor(Color::White),
             Print(" Press r to restart "),
             ResetColor
@@ -725,5 +888,296 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn each_piece_shape_has_four_cells() {
+        for piece in Piece::all() {
+            for rot in 0..4 {
+                let cells = piece.shape(rot);
+                assert_eq!(cells.len(), 4);
+                for (r, c) in cells {
+                    assert!(
+                        (0..4).contains(&r),
+                        "{:?} rot {} row out of 4x4 box",
+                        piece,
+                        rot
+                    );
+                    assert!(
+                        (0..4).contains(&c),
+                        "{:?} rot {} col out of 4x4 box",
+                        piece,
+                        rot
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bag_first_seven_draws_are_unique() {
+        let mut bag = Bag::new();
+        let mut seen: HashSet<Piece> = HashSet::new();
+        for _ in 0..7 {
+            seen.insert(bag.next());
+        }
+        assert_eq!(seen.len(), 7);
+    }
+
+    #[test]
+    fn bag_peek_does_not_consume() {
+        let mut bag = Bag::new();
+        let preview = bag.peek_n(5);
+        assert_eq!(preview.len(), 5);
+        for expected in preview {
+            assert_eq!(bag.next(), expected);
+        }
+    }
+
+    #[test]
+    fn collide_detects_walls_and_floor() {
+        let game = Game::new(0);
+        assert!(game.collides(&[(0, -1), (0, 0), (0, 0), (0, 0)]));
+        assert!(game.collides(&[(0, WIDTH as i32), (0, 0), (0, 0), (0, 0)]));
+        assert!(game.collides(&[(HEIGHT as i32, 0), (0, 0), (0, 0), (0, 0)]));
+        // Cells above the visible field (negative row) should not collide
+        assert!(!game.collides(&[(-1, 0), (-1, 1), (0, 0), (0, 1)]));
+    }
+
+    #[test]
+    fn collide_detects_occupied_cells() {
+        let mut game = Game::new(0);
+        game.board[5][3] = Some(Color::Red);
+        assert!(game.collides(&[(5, 3), (0, 0), (0, 1), (0, 2)]));
+        assert!(!game.collides(&[(0, 0), (0, 1), (0, 2), (0, 3)]));
+    }
+
+    #[test]
+    fn clear_full_lines_clears_one_and_shifts() {
+        let mut game = Game::new(0);
+        for c in 0..WIDTH {
+            game.board[HEIGHT - 1][c] = Some(Color::Red);
+        }
+        for c in 0..5 {
+            game.board[HEIGHT - 2][c] = Some(Color::Blue);
+        }
+        let cleared = game.clear_full_lines();
+        assert_eq!(cleared, 1);
+        for c in 0..5 {
+            assert_eq!(game.board[HEIGHT - 1][c], Some(Color::Blue));
+        }
+        for c in 5..WIDTH {
+            assert!(game.board[HEIGHT - 1][c].is_none());
+        }
+    }
+
+    #[test]
+    fn clear_full_lines_clears_tetris() {
+        let mut game = Game::new(0);
+        for r in (HEIGHT - 4)..HEIGHT {
+            for c in 0..WIDTH {
+                game.board[r][c] = Some(Color::Red);
+            }
+        }
+        let cleared = game.clear_full_lines();
+        assert_eq!(cleared, 4);
+        for r in 0..HEIGHT {
+            for c in 0..WIDTH {
+                assert!(game.board[r][c].is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn scoring_basic_clears_at_level_one() {
+        let mut game = Game::new(0);
+        game.level = 1;
+        game.apply_score(TSpinType::None, 1);
+        assert_eq!(game.score, 100);
+        game.apply_score(TSpinType::None, 4);
+        assert_eq!(game.score, 100 + 800);
+    }
+
+    #[test]
+    fn scoring_tspin_bonuses() {
+        let mut game = Game::new(0);
+        game.level = 1;
+        game.apply_score(TSpinType::Full, 0);
+        assert_eq!(game.score, 400);
+        game.apply_score(TSpinType::Full, 2);
+        assert_eq!(game.score, 400 + 1200);
+        game.apply_score(TSpinType::Mini, 1);
+        assert_eq!(game.score, 1600 + 200);
+    }
+
+    #[test]
+    fn scoring_scales_with_level() {
+        let mut game = Game::new(0);
+        game.level = 5;
+        game.apply_score(TSpinType::None, 1);
+        assert_eq!(game.score, 500);
+    }
+
+    #[test]
+    fn level_advances_every_ten_lines() {
+        let mut game = Game::new(0);
+        for _ in 0..10 {
+            game.apply_score(TSpinType::None, 1);
+        }
+        assert_eq!(game.lines, 10);
+        assert_eq!(game.level, 2);
+    }
+
+    #[test]
+    fn ghost_row_finds_floor_for_o_piece() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::O,
+            rot: 0,
+            row: 0,
+            col: 4,
+        };
+        assert_eq!(game.ghost_row(), HEIGHT as i32 - 2);
+    }
+
+    #[test]
+    fn srs_kicks_o_returns_only_zero_offset() {
+        for from in 0..4 {
+            for to in 0..4 {
+                for k in srs_kicks(Piece::O, from, to) {
+                    assert_eq!(k, (0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn srs_kicks_first_test_is_always_zero() {
+        for piece in Piece::all() {
+            for from in 0..4 {
+                for to in 0..4 {
+                    if from == to {
+                        continue;
+                    }
+                    let kicks = srs_kicks(piece, from, to);
+                    assert_eq!(kicks[0], (0, 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_succeeds_on_empty_board() {
+        let mut game = Game::new(0);
+        assert!(game.try_rotate(1));
+        assert_eq!(game.active.rot, 1);
+        assert!(game.last_was_rotation);
+        // Lateral move resets the rotation flag
+        game.try_move(0, 1);
+        assert!(!game.last_was_rotation);
+    }
+
+    #[test]
+    fn detect_tspin_requires_t_piece() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::I,
+            rot: 0,
+            row: 0,
+            col: 3,
+        };
+        game.last_was_rotation = true;
+        assert_eq!(game.detect_tspin(), TSpinType::None);
+    }
+
+    #[test]
+    fn detect_tspin_requires_recent_rotation() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::T,
+            rot: 0,
+            row: HEIGHT as i32 - 3,
+            col: 0,
+        };
+        game.last_was_rotation = false;
+        game.board[HEIGHT - 1][0] = Some(Color::Red);
+        game.board[HEIGHT - 1][2] = Some(Color::Red);
+        game.board[HEIGHT - 3][0] = Some(Color::Red);
+        assert_eq!(game.detect_tspin(), TSpinType::None);
+    }
+
+    #[test]
+    fn detect_tspin_full_when_both_back_corners_filled() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::T,
+            rot: 0,
+            row: HEIGHT as i32 - 3,
+            col: 0,
+        };
+        game.last_was_rotation = true;
+        // Back corners (rot 0): (2,0) and (2,2) relative = (HEIGHT-1, 0), (HEIGHT-1, 2)
+        game.board[HEIGHT - 1][0] = Some(Color::Red);
+        game.board[HEIGHT - 1][2] = Some(Color::Red);
+        // One front corner to satisfy count >= 3
+        game.board[HEIGHT - 3][0] = Some(Color::Red);
+        assert_eq!(game.detect_tspin(), TSpinType::Full);
+    }
+
+    #[test]
+    fn detect_tspin_mini_when_only_front_corners_filled() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::T,
+            rot: 0,
+            row: HEIGHT as i32 - 3,
+            col: 0,
+        };
+        game.last_was_rotation = true;
+        // Front corners (rot 0): (0,0) and (0,2) relative
+        game.board[HEIGHT - 3][0] = Some(Color::Red);
+        game.board[HEIGHT - 3][2] = Some(Color::Red);
+        // Only one back corner
+        game.board[HEIGHT - 1][0] = Some(Color::Red);
+        assert_eq!(game.detect_tspin(), TSpinType::Mini);
+    }
+
+    #[test]
+    fn after_move_starts_lock_timer_when_grounded() {
+        let mut game = Game::new(0);
+        // Fill the row directly below where the piece will land
+        // Use an O piece for simplicity
+        game.active = Active {
+            piece: Piece::O,
+            rot: 0,
+            row: HEIGHT as i32 - 2,
+            col: 4,
+        };
+        game.lock_timer = None;
+        game.after_move(false);
+        assert!(
+            game.lock_timer.is_some(),
+            "should set lock timer when grounded"
+        );
+    }
+
+    #[test]
+    fn after_move_clears_lock_timer_when_airborne() {
+        let mut game = Game::new(0);
+        game.active = Active {
+            piece: Piece::O,
+            rot: 0,
+            row: 0,
+            col: 4,
+        };
+        game.lock_timer = Some(Instant::now());
+        game.after_move(true);
+        assert!(game.lock_timer.is_none());
     }
 }

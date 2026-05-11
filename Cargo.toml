@@ -17,7 +17,7 @@ name = "tetris"
 path = "src/main.rs"
 
 [dependencies]
-crossterm = "0.27"
+crossterm = "0.29"
 rand = "0.8"
 
 [profile.release]

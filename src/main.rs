@@ -1,6 +1,9 @@
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -16,9 +19,47 @@ const WIDTH: usize = 10;
 const HEIGHT: usize = 20;
 const LOCK_DELAY_MS: u64 = 500;
 const MAX_LOCK_RESETS: u8 = 15;
-const SCORES_FILE: &str = ".tetris_scores";
 const SCORES_KEEP: usize = 10;
 const NEXT_PREVIEW: usize = 5;
+const SPRINT_LINES: u32 = 40;
+const ULTRA_SECS: u64 = 120;
+const DAS_MS: u64 = 167;
+const ARR_MS: u64 = 33;
+const SDR_MS: u64 = 50;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Marathon,
+    Sprint,
+    Ultra,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Marathon => "Marathon",
+            Mode::Sprint => "Sprint",
+            Mode::Ultra => "Ultra",
+        }
+    }
+
+    fn scores_filename(self) -> &'static str {
+        match self {
+            Mode::Marathon => ".tetris_scores_marathon",
+            Mode::Sprint => ".tetris_scores_sprint",
+            Mode::Ultra => ".tetris_scores_ultra",
+        }
+    }
+
+    fn from_arg(s: &str) -> Option<Mode> {
+        match s.to_ascii_lowercase().as_str() {
+            "marathon" => Some(Mode::Marathon),
+            "sprint" => Some(Mode::Sprint),
+            "ultra" => Some(Mode::Ultra),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum Piece {
@@ -198,31 +239,51 @@ impl Bag {
     }
 }
 
-fn scores_path() -> PathBuf {
+fn scores_path(mode: Mode) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(SCORES_FILE)
+    PathBuf::from(home).join(mode.scores_filename())
 }
 
-fn load_scores() -> Vec<u32> {
-    let mut scores: Vec<u32> = fs::read_to_string(scores_path())
+// Scores are stored highest-first for Marathon/Ultra; for Sprint we store the
+// 40-line completion times (milliseconds), lowest-first.
+fn load_scores(mode: Mode) -> Vec<u32> {
+    let mut scores: Vec<u32> = fs::read_to_string(scores_path(mode))
         .ok()
         .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
         .unwrap_or_default();
-    scores.sort_by(|a, b| b.cmp(a));
+    sort_scores(mode, &mut scores);
     scores.truncate(SCORES_KEEP);
     scores
 }
 
-fn save_scores(scores: &[u32]) {
+fn save_scores(mode: Mode, scores: &[u32]) {
     let body = scores
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = fs::write(scores_path(), body);
+    let _ = fs::write(scores_path(mode), body);
+}
+
+fn sort_scores(mode: Mode, scores: &mut [u32]) {
+    match mode {
+        // Lower time is better
+        Mode::Sprint => scores.sort(),
+        // Higher score is better
+        Mode::Marathon | Mode::Ultra => scores.sort_by(|a, b| b.cmp(a)),
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    let centi = (ms % 1000) / 10;
+    format!("{:02}:{:02}.{:02}", minutes, seconds, centi)
 }
 
 struct Game {
+    mode: Mode,
     board: [[Option<Color>; WIDTH]; HEIGHT],
     active: Active,
     bag: Bag,
@@ -234,6 +295,8 @@ struct Game {
     lines: u32,
     level: u32,
     best_score: u32,
+    started_at: Instant,
+    final_time_ms: Option<u64>,
     game_over: bool,
     paused: bool,
     score_saved: bool,
@@ -243,10 +306,11 @@ struct Game {
 }
 
 impl Game {
-    fn new(best_score: u32) -> Self {
+    fn new(mode: Mode, best_score: u32) -> Self {
         let mut bag = Bag::new();
         let piece = bag.next();
         Game {
+            mode,
             board: [[None; WIDTH]; HEIGHT],
             active: Active {
                 piece,
@@ -263,12 +327,57 @@ impl Game {
             lines: 0,
             level: 1,
             best_score,
+            started_at: Instant::now(),
+            final_time_ms: None,
             game_over: false,
             paused: false,
             score_saved: false,
             last_was_rotation: false,
             last_clear_text: None,
             last_clear_at: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.final_time_ms
+            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64)
+    }
+
+    fn time_remaining_ms(&self) -> u64 {
+        let limit = ULTRA_SECS * 1000;
+        let elapsed = self.elapsed_ms();
+        limit.saturating_sub(elapsed)
+    }
+
+    fn lines_remaining(&self) -> u32 {
+        SPRINT_LINES.saturating_sub(self.lines)
+    }
+
+    // Returns true if the mode's terminating condition has been hit (and freezes the final time).
+    fn check_mode_end(&mut self) -> bool {
+        if self.game_over {
+            return true;
+        }
+        match self.mode {
+            Mode::Marathon => false,
+            Mode::Sprint => {
+                if self.lines >= SPRINT_LINES {
+                    self.final_time_ms = Some(self.elapsed_ms());
+                    self.game_over = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            Mode::Ultra => {
+                if self.elapsed_ms() >= ULTRA_SECS * 1000 {
+                    self.final_time_ms = Some(ULTRA_SECS * 1000);
+                    self.game_over = true;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -545,11 +654,26 @@ impl Game {
         if self.score_saved {
             return;
         }
-        let mut scores = load_scores();
-        scores.push(self.score);
-        scores.sort_by(|a, b| b.cmp(a));
-        scores.truncate(SCORES_KEEP);
-        save_scores(&scores);
+        // What we save depends on the mode.
+        // Sprint: the elapsed time (ms) when 40 lines were cleared — only saved on completion.
+        // Marathon / Ultra: the final score.
+        let metric: Option<u32> = match self.mode {
+            Mode::Sprint => {
+                if self.lines >= SPRINT_LINES {
+                    Some(self.elapsed_ms().min(u32::MAX as u64) as u32)
+                } else {
+                    None
+                }
+            }
+            Mode::Marathon | Mode::Ultra => Some(self.score),
+        };
+        let mut scores = load_scores(self.mode);
+        if let Some(m) = metric {
+            scores.push(m);
+            sort_scores(self.mode, &mut scores);
+            scores.truncate(SCORES_KEEP);
+            save_scores(self.mode, &scores);
+        }
         if let Some(&best) = scores.first() {
             self.best_score = best;
         }
@@ -672,6 +796,14 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
     queue!(
         out,
         cursor::MoveTo(info_x, y),
+        SetForegroundColor(Color::Cyan),
+        Print(format!("[{}]", game.mode.name())),
+        ResetColor
+    )?;
+    y += 2;
+    queue!(
+        out,
+        cursor::MoveTo(info_x, y),
         Print(format!("Score: {}", game.score))
     )?;
     y += 1;
@@ -687,11 +819,28 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
         Print(format!("Level: {}", game.level))
     )?;
     y += 1;
+    // Mode-specific row
+    let mode_line = match game.mode {
+        Mode::Marathon => format!("Time:  {}", format_duration_ms(game.elapsed_ms())),
+        Mode::Sprint => format!(
+            "Left:  {}  ({})",
+            game.lines_remaining(),
+            format_duration_ms(game.elapsed_ms())
+        ),
+        Mode::Ultra => format!("Time:  {}", format_duration_ms(game.time_remaining_ms())),
+    };
+    queue!(out, cursor::MoveTo(info_x, y), Print(mode_line))?;
+    y += 1;
+    let best_label = if game.mode == Mode::Sprint && game.best_score > 0 {
+        format!("Best:  {}", format_duration_ms(game.best_score as u64))
+    } else {
+        format!("Best:  {}", game.best_score)
+    };
     queue!(
         out,
         cursor::MoveTo(info_x, y),
         SetForegroundColor(Color::Yellow),
-        Print(format!("Best:  {}", game.best_score)),
+        Print(best_label),
         ResetColor
     )?;
     y += 2;
@@ -782,19 +931,142 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run() -> std::io::Result<()> {
+fn parse_mode_arg() -> Result<Mode, String> {
+    let mut args = std::env::args().skip(1);
+    let mut mode = Mode::Marathon;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--mode" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "--mode requires a value".to_string())?;
+                mode = Mode::from_arg(&v).ok_or_else(|| {
+                    format!("unknown mode: {} (expected marathon|sprint|ultra)", v)
+                })?;
+            }
+            "-h" | "--help" => {
+                println!("Usage: tetris [--mode marathon|sprint|ultra]");
+                std::process::exit(0);
+            }
+            _ => return Err(format!("unknown argument: {}", a)),
+        }
+    }
+    Ok(mode)
+}
+
+#[derive(Default)]
+struct DirHeld {
+    held_since: Option<Instant>,
+    das_satisfied: bool,
+    last_shift_at: Option<Instant>,
+}
+
+impl DirHeld {
+    fn press(&mut self) {
+        self.held_since = Some(Instant::now());
+        self.das_satisfied = false;
+        self.last_shift_at = None;
+    }
+    fn release(&mut self) {
+        self.held_since = None;
+        self.das_satisfied = false;
+        self.last_shift_at = None;
+    }
+    // Returns how many shifts to apply this frame.
+    fn tick(&mut self, das: Duration, rate: Duration) -> usize {
+        let Some(since) = self.held_since else {
+            return 0;
+        };
+        let now = Instant::now();
+        if !self.das_satisfied {
+            if now.duration_since(since) >= das {
+                self.das_satisfied = true;
+                self.last_shift_at = Some(now);
+                return 1;
+            }
+            return 0;
+        }
+        let rate = rate.max(Duration::from_millis(1));
+        let mut last = self.last_shift_at.unwrap_or(now);
+        let mut count = 0;
+        while now.saturating_duration_since(last) >= rate {
+            count += 1;
+            last += rate;
+            if count >= 30 {
+                break;
+            }
+        }
+        if count > 0 {
+            self.last_shift_at = Some(last);
+        }
+        count
+    }
+}
+
+#[derive(Default)]
+struct Input {
+    // Only enabled once we observe a key Release event — proves the terminal
+    // supports the kitty keyboard protocol. Otherwise we fall back to bare
+    // OS key-repeat semantics for everyone.
+    arr_enabled: bool,
+    left: DirHeld,
+    right: DirHeld,
+    down: DirHeld,
+}
+
+impl Input {
+    fn on_press(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left => {
+                self.left.press();
+                self.right.release();
+            }
+            KeyCode::Right => {
+                self.right.press();
+                self.left.release();
+            }
+            KeyCode::Down => self.down.press(),
+            _ => {}
+        }
+    }
+    fn on_release(&mut self, code: KeyCode) {
+        self.arr_enabled = true;
+        match code {
+            KeyCode::Left => self.left.release(),
+            KeyCode::Right => self.right.release(),
+            KeyCode::Down => self.down.release(),
+            _ => {}
+        }
+    }
+}
+
+fn run(mode: Mode) -> std::io::Result<()> {
     let mut out = stdout();
     terminal::enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, cursor::Hide)?;
+    // Request key release/repeat events. Silently no-op on terminals that
+    // don't implement the kitty keyboard protocol.
+    let pushed_kbd_flags = execute!(
+        out,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )
+    .is_ok();
 
-    let initial_best = load_scores().first().copied().unwrap_or(0);
-    let mut game = Game::new(initial_best);
+    let initial_best = load_scores(mode).first().copied().unwrap_or(0);
+    let mut game = Game::new(mode, initial_best);
     let mut last_tick = Instant::now();
+    let mut input = Input::default();
 
     let result = (|| -> std::io::Result<()> {
         loop {
             draw(&mut out, &mut game)?;
 
+            if !game.game_over {
+                game.check_mode_end();
+            }
             if game.game_over && !game.score_saved {
                 game.on_game_over_save();
             }
@@ -808,7 +1080,26 @@ fn run() -> std::io::Result<()> {
                     Some(t) => Duration::from_millis(LOCK_DELAY_MS).saturating_sub(t.elapsed()),
                     None => Duration::from_millis(1000),
                 };
-                let t = std::cmp::min(gravity_remaining, lock_remaining);
+                let mode_remaining = if game.mode == Mode::Ultra {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(1)
+                };
+                // When auto-shift is active, wake up at least every ARR/SDR
+                // interval so we can fire repeats smoothly.
+                let arr_remaining = if input.arr_enabled
+                    && (input.left.held_since.is_some()
+                        || input.right.held_since.is_some()
+                        || input.down.held_since.is_some())
+                {
+                    Duration::from_millis(ARR_MS.min(SDR_MS))
+                } else {
+                    Duration::from_secs(1)
+                };
+                let t = gravity_remaining
+                    .min(lock_remaining)
+                    .min(mode_remaining)
+                    .min(arr_remaining);
                 if t.is_zero() {
                     Duration::from_millis(1)
                 } else {
@@ -818,15 +1109,28 @@ fn run() -> std::io::Result<()> {
 
             if event::poll(timeout)? {
                 if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
-                    if kind == KeyEventKind::Release {
-                        continue;
+                    match kind {
+                        KeyEventKind::Release => {
+                            input.on_release(code);
+                            continue;
+                        }
+                        KeyEventKind::Repeat => {
+                            input.arr_enabled = true;
+                            // Don't re-apply: held-key auto-shift handles it.
+                            continue;
+                        }
+                        KeyEventKind::Press => {}
                     }
                     match code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => {
                             let best = game.best_score;
-                            game = Game::new(best);
+                            game = Game::new(mode, best);
                             last_tick = Instant::now();
+                            input = Input {
+                                arr_enabled: input.arr_enabled,
+                                ..Default::default()
+                            };
                         }
                         KeyCode::Char('p') => {
                             if !game.game_over {
@@ -837,6 +1141,7 @@ fn run() -> std::io::Result<()> {
                             if game.game_over || game.paused {
                                 continue;
                             }
+                            input.on_press(code);
                             match code {
                                 KeyCode::Left => {
                                     game.try_move(0, -1);
@@ -869,6 +1174,30 @@ fn run() -> std::io::Result<()> {
             }
 
             if !game.game_over && !game.paused {
+                if input.arr_enabled {
+                    let das = Duration::from_millis(DAS_MS);
+                    let arr = Duration::from_millis(ARR_MS);
+                    let sdr = Duration::from_millis(SDR_MS);
+                    let left_n = input.left.tick(das, arr);
+                    for _ in 0..left_n {
+                        if !game.try_move(0, -1) {
+                            break;
+                        }
+                    }
+                    let right_n = input.right.tick(das, arr);
+                    for _ in 0..right_n {
+                        if !game.try_move(0, 1) {
+                            break;
+                        }
+                    }
+                    let down_n = input.down.tick(sdr, sdr);
+                    if down_n > 0 {
+                        for _ in 0..down_n {
+                            game.soft_drop();
+                        }
+                        last_tick = Instant::now();
+                    }
+                }
                 if last_tick.elapsed() >= Duration::from_millis(game.gravity_ms()) {
                     game.gravity_tick();
                     last_tick = Instant::now();
@@ -879,13 +1208,24 @@ fn run() -> std::io::Result<()> {
         Ok(())
     })();
 
+    if pushed_kbd_flags {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
     execute!(out, cursor::Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
     result
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let mode = match parse_mode_arg() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            eprintln!("usage: tetris [--mode marathon|sprint|ultra]");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = run(mode) {
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
@@ -942,7 +1282,7 @@ mod tests {
 
     #[test]
     fn collide_detects_walls_and_floor() {
-        let game = Game::new(0);
+        let game = Game::new(Mode::Marathon, 0);
         assert!(game.collides(&[(0, -1), (0, 0), (0, 0), (0, 0)]));
         assert!(game.collides(&[(0, WIDTH as i32), (0, 0), (0, 0), (0, 0)]));
         assert!(game.collides(&[(HEIGHT as i32, 0), (0, 0), (0, 0), (0, 0)]));
@@ -952,7 +1292,7 @@ mod tests {
 
     #[test]
     fn collide_detects_occupied_cells() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.board[5][3] = Some(Color::Red);
         assert!(game.collides(&[(5, 3), (0, 0), (0, 1), (0, 2)]));
         assert!(!game.collides(&[(0, 0), (0, 1), (0, 2), (0, 3)]));
@@ -960,7 +1300,7 @@ mod tests {
 
     #[test]
     fn clear_full_lines_clears_one_and_shifts() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         for c in 0..WIDTH {
             game.board[HEIGHT - 1][c] = Some(Color::Red);
         }
@@ -979,7 +1319,7 @@ mod tests {
 
     #[test]
     fn clear_full_lines_clears_tetris() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         for r in (HEIGHT - 4)..HEIGHT {
             for c in 0..WIDTH {
                 game.board[r][c] = Some(Color::Red);
@@ -996,7 +1336,7 @@ mod tests {
 
     #[test]
     fn scoring_basic_clears_at_level_one() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.level = 1;
         game.apply_score(TSpinType::None, 1);
         assert_eq!(game.score, 100);
@@ -1006,7 +1346,7 @@ mod tests {
 
     #[test]
     fn scoring_tspin_bonuses() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.level = 1;
         game.apply_score(TSpinType::Full, 0);
         assert_eq!(game.score, 400);
@@ -1018,7 +1358,7 @@ mod tests {
 
     #[test]
     fn scoring_scales_with_level() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.level = 5;
         game.apply_score(TSpinType::None, 1);
         assert_eq!(game.score, 500);
@@ -1026,7 +1366,7 @@ mod tests {
 
     #[test]
     fn level_advances_every_ten_lines() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         for _ in 0..10 {
             game.apply_score(TSpinType::None, 1);
         }
@@ -1036,7 +1376,7 @@ mod tests {
 
     #[test]
     fn ghost_row_finds_floor_for_o_piece() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::O,
             rot: 0,
@@ -1074,7 +1414,7 @@ mod tests {
 
     #[test]
     fn rotation_succeeds_on_empty_board() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         assert!(game.try_rotate(1));
         assert_eq!(game.active.rot, 1);
         assert!(game.last_was_rotation);
@@ -1085,7 +1425,7 @@ mod tests {
 
     #[test]
     fn detect_tspin_requires_t_piece() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::I,
             rot: 0,
@@ -1098,7 +1438,7 @@ mod tests {
 
     #[test]
     fn detect_tspin_requires_recent_rotation() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::T,
             rot: 0,
@@ -1114,7 +1454,7 @@ mod tests {
 
     #[test]
     fn detect_tspin_full_when_both_back_corners_filled() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::T,
             rot: 0,
@@ -1132,7 +1472,7 @@ mod tests {
 
     #[test]
     fn detect_tspin_mini_when_only_front_corners_filled() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::T,
             rot: 0,
@@ -1150,7 +1490,7 @@ mod tests {
 
     #[test]
     fn after_move_starts_lock_timer_when_grounded() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         // Fill the row directly below where the piece will land
         // Use an O piece for simplicity
         game.active = Active {
@@ -1169,7 +1509,7 @@ mod tests {
 
     #[test]
     fn after_move_clears_lock_timer_when_airborne() {
-        let mut game = Game::new(0);
+        let mut game = Game::new(Mode::Marathon, 0);
         game.active = Active {
             piece: Piece::O,
             rot: 0,

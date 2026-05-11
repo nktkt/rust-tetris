@@ -226,6 +226,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "srs-tetris"
+version = "0.2.0"
+dependencies = [
+ "crossterm",
+ "rand",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -234,14 +242,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tetris"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "rand",
 ]
 
 [[package]]

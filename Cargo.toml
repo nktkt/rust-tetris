@@ -1,15 +1,20 @@
 [package]
-name = "tetris"
-version = "0.1.0"
+name = "srs-tetris"
+version = "0.2.0"
 edition = "2021"
 authors = ["nktkt"]
-description = "A terminal-based Tetris clone in Rust with full SRS, T-spin detection, hold, lock delay, DAS/ARR, and game modes."
+description = "A terminal-based Tetris clone in Rust with full SRS rotation, T-spin / T-spin Mini detection, hold, lock delay, DAS/ARR, line-clear animation, and three game modes (Marathon, Sprint, Ultra)."
 license = "MIT"
 repository = "https://github.com/nktkt/rust-tetris"
 homepage = "https://github.com/nktkt/rust-tetris"
 readme = "README.md"
 keywords = ["tetris", "tui", "game", "terminal", "crossterm"]
 categories = ["games", "command-line-utilities"]
+exclude = ["docs/*", ".github/*", "/target"]
+
+[[bin]]
+name = "tetris"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.27"

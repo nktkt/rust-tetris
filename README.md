@@ -3,6 +3,7 @@
 A terminal-based Tetris clone written in Rust, built on top of [`crossterm`](https://crates.io/crates/crossterm).
 
 [![CI](https://github.com/nktkt/rust-tetris/actions/workflows/ci.yml/badge.svg)](https://github.com/nktkt/rust-tetris/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/srs-tetris.svg)](https://crates.io/crates/srs-tetris)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 ![rust](https://img.shields.io/badge/rust-2021-orange)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -57,14 +58,18 @@ A terminal-based Tetris clone written in Rust, built on top of [`crossterm`](htt
 Requires Rust 1.70+ and Cargo.
 
 ```sh
+# Install from crates.io
+cargo install srs-tetris
+
+# Or build from source
 git clone https://github.com/nktkt/rust-tetris.git
 cd rust-tetris
 cargo install --path .
 ```
 
-This installs the `tetris` binary into `~/.cargo/bin`.
+Both put a `tetris` binary in `~/.cargo/bin`. Prebuilt binaries for Linux, macOS (x86_64 / aarch64), and Windows are also published on the [GitHub Releases page](https://github.com/nktkt/rust-tetris/releases).
 
-Alternatively, run directly without installing:
+To run directly without installing:
 
 ```sh
 cargo run --release

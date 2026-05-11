@@ -26,6 +26,7 @@ const ULTRA_SECS: u64 = 120;
 const DAS_MS: u64 = 167;
 const ARR_MS: u64 = 33;
 const SDR_MS: u64 = 50;
+const CLEAR_ANIM_MS: u64 = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
@@ -303,6 +304,16 @@ struct Game {
     last_was_rotation: bool,
     last_clear_text: Option<String>,
     last_clear_at: Option<Instant>,
+    // Back-to-Back chain is "active" once a difficult clear (Tetris or
+    // T-Spin with lines) is performed, and stays active across no-clear
+    // locks. A non-difficult line clear breaks it.
+    b2b_active: bool,
+    // Combo counter: -1 = no current combo, 0+ = number of consecutive
+    // clears in this combo minus one (so 0 means "second clear in a row").
+    combo: i32,
+    // When Some, the listed rows are being flashed before being collapsed.
+    // While present, gameplay (gravity / input movement) is frozen.
+    clearing_rows: Option<(Vec<usize>, Instant)>,
 }
 
 impl Game {
@@ -335,6 +346,9 @@ impl Game {
             last_was_rotation: false,
             last_clear_text: None,
             last_clear_at: None,
+            b2b_active: false,
+            combo: -1,
+            clearing_rows: None,
         }
     }
 
@@ -505,34 +519,76 @@ impl Game {
                 self.board[r as usize][c as usize] = Some(color);
             }
         }
-        let cleared = self.clear_full_lines();
+        let full_rows = self.full_rows();
+        let cleared = full_rows.len() as u32;
         self.apply_score(tspin, cleared);
-        self.lock_timer = None;
-        self.lock_resets = 0;
-        self.hold_used = false;
-        self.spawn_next();
+        if cleared > 0 {
+            // Defer the actual collapse so the rows flash for CLEAR_ANIM_MS.
+            self.clearing_rows = Some((full_rows, Instant::now()));
+            self.lock_timer = None;
+            self.lock_resets = 0;
+        } else {
+            self.lock_timer = None;
+            self.lock_resets = 0;
+            self.hold_used = false;
+            self.spawn_next();
+        }
     }
 
-    fn clear_full_lines(&mut self) -> u32 {
-        let mut cleared = 0u32;
+    fn full_rows(&self) -> Vec<usize> {
+        (0..HEIGHT)
+            .filter(|&r| self.board[r].iter().all(|c| c.is_some()))
+            .collect()
+    }
+
+    fn collapse_rows(&mut self, rows: &[usize]) {
         let mut new_board: [[Option<Color>; WIDTH]; HEIGHT] = [[None; WIDTH]; HEIGHT];
         let mut new_row = HEIGHT as i32 - 1;
         for r in (0..HEIGHT).rev() {
-            let full = self.board[r].iter().all(|c| c.is_some());
-            if full {
-                cleared += 1;
-            } else if new_row >= 0 {
+            if !rows.contains(&r) && new_row >= 0 {
                 new_board[new_row as usize] = self.board[r];
                 new_row -= 1;
             }
         }
         self.board = new_board;
-        cleared
+    }
+
+    // Kept for tests / backwards compat: synchronously detect + remove full rows
+    // without any animation. Returns the number of rows cleared.
+    #[cfg(test)]
+    fn clear_full_lines(&mut self) -> u32 {
+        let rows = self.full_rows();
+        let n = rows.len() as u32;
+        self.collapse_rows(&rows);
+        n
+    }
+
+    // Steps a pending clear-animation. Returns true if the collapse just fired.
+    fn step_clear_animation(&mut self) -> bool {
+        let due = match &self.clearing_rows {
+            Some((_, t)) => t.elapsed() >= Duration::from_millis(CLEAR_ANIM_MS),
+            None => false,
+        };
+        if !due {
+            return false;
+        }
+        if let Some((rows, _)) = self.clearing_rows.take() {
+            self.collapse_rows(&rows);
+            self.hold_used = false;
+            self.spawn_next();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_animating(&self) -> bool {
+        self.clearing_rows.is_some()
     }
 
     fn apply_score(&mut self, tspin: TSpinType, cleared: u32) {
         self.lines += cleared;
-        let (points, label): (u32, Option<&'static str>) = match (tspin, cleared) {
+        let (base, label): (u32, Option<&'static str>) = match (tspin, cleared) {
             (TSpinType::Full, 0) => (400, Some("T-SPIN")),
             (TSpinType::Full, 1) => (800, Some("T-SPIN SINGLE")),
             (TSpinType::Full, 2) => (1200, Some("T-SPIN DOUBLE")),
@@ -546,13 +602,44 @@ impl Game {
             (TSpinType::None, 4) => (800, Some("TETRIS")),
             _ => (0, None),
         };
+
+        // A clear is "difficult" if it's a Tetris or any T-Spin with lines.
+        let is_difficult = cleared > 0 && (tspin != TSpinType::None || cleared == 4);
+        let b2b_continued = is_difficult && self.b2b_active;
+        let combo_count = if cleared > 0 { self.combo + 1 } else { -1 };
+
+        // Base + B2B multiplier
+        let mut points = if b2b_continued { base * 3 / 2 } else { base };
+        // Combo bonus
+        if combo_count > 0 {
+            points += 50 * combo_count as u32;
+        }
         if points > 0 {
             self.score += points * self.level;
         }
-        if let Some(text) = label {
-            self.last_clear_text = Some(text.to_string());
+
+        // Build display label
+        let mut parts: Vec<String> = Vec::new();
+        if b2b_continued {
+            parts.push("B2B".into());
+        }
+        if let Some(s) = label {
+            parts.push(s.into());
+        }
+        if combo_count > 0 {
+            parts.push(format!("x{} COMBO", combo_count + 1));
+        }
+        if !parts.is_empty() {
+            self.last_clear_text = Some(parts.join(" "));
             self.last_clear_at = Some(Instant::now());
         }
+
+        // Update B2B / combo state for next lock
+        self.combo = combo_count;
+        if cleared > 0 {
+            self.b2b_active = is_difficult;
+        }
+
         if cleared > 0 {
             self.level = 1 + self.lines / 10;
         }
@@ -734,6 +821,18 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
         .cells_with(game.active.rot, ghost_r, game.active.col);
     let active_cells = game.active.cells();
 
+    // While a clear animation is playing, alternate the cleared rows
+    // between bright white and blank to make them flash.
+    let clearing_row = |r: usize| -> Option<bool> {
+        let (rows, t) = game.clearing_rows.as_ref()?;
+        if !rows.contains(&r) {
+            return None;
+        }
+        // ~30ms strobe
+        let phase = (t.elapsed().as_millis() / 30) % 2 == 0;
+        Some(phase)
+    };
+
     for r in 0..HEIGHT {
         queue!(
             out,
@@ -741,6 +840,7 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
             Print("│")
         )?;
         queue!(out, cursor::MoveTo(board_x, board_y + r as u16))?;
+        let flash = clearing_row(r);
         for c in 0..WIDTH {
             let cell_color: Option<Color> = game.board[r][c];
             let is_active = active_cells
@@ -751,7 +851,18 @@ fn draw<W: Write>(out: &mut W, game: &mut Game) -> std::io::Result<()> {
                     .iter()
                     .any(|&(gr, gc)| gr == r as i32 && gc == c as i32);
 
-            if let Some(col) = cell_color {
+            if let Some(phase) = flash {
+                if phase {
+                    queue!(
+                        out,
+                        SetForegroundColor(Color::White),
+                        Print("██"),
+                        ResetColor
+                    )?;
+                } else {
+                    queue!(out, Print("  "))?;
+                }
+            } else if let Some(col) = cell_color {
                 queue!(out, SetForegroundColor(col), Print("██"), ResetColor)?;
             } else if is_active {
                 queue!(
@@ -1096,10 +1207,17 @@ fn run(mode: Mode) -> std::io::Result<()> {
                 } else {
                     Duration::from_secs(1)
                 };
+                let anim_remaining = match &game.clearing_rows {
+                    Some((_, t)) => {
+                        Duration::from_millis(CLEAR_ANIM_MS).saturating_sub(t.elapsed())
+                    }
+                    None => Duration::from_secs(1),
+                };
                 let t = gravity_remaining
                     .min(lock_remaining)
                     .min(mode_remaining)
-                    .min(arr_remaining);
+                    .min(arr_remaining)
+                    .min(anim_remaining);
                 if t.is_zero() {
                     Duration::from_millis(1)
                 } else {
@@ -1138,7 +1256,7 @@ fn run(mode: Mode) -> std::io::Result<()> {
                             }
                         }
                         _ => {
-                            if game.game_over || game.paused {
+                            if game.game_over || game.paused || game.is_animating() {
                                 continue;
                             }
                             input.on_press(code);
@@ -1174,35 +1292,41 @@ fn run(mode: Mode) -> std::io::Result<()> {
             }
 
             if !game.game_over && !game.paused {
-                if input.arr_enabled {
-                    let das = Duration::from_millis(DAS_MS);
-                    let arr = Duration::from_millis(ARR_MS);
-                    let sdr = Duration::from_millis(SDR_MS);
-                    let left_n = input.left.tick(das, arr);
-                    for _ in 0..left_n {
-                        if !game.try_move(0, -1) {
-                            break;
-                        }
-                    }
-                    let right_n = input.right.tick(das, arr);
-                    for _ in 0..right_n {
-                        if !game.try_move(0, 1) {
-                            break;
-                        }
-                    }
-                    let down_n = input.down.tick(sdr, sdr);
-                    if down_n > 0 {
-                        for _ in 0..down_n {
-                            game.soft_drop();
-                        }
-                        last_tick = Instant::now();
-                    }
-                }
-                if last_tick.elapsed() >= Duration::from_millis(game.gravity_ms()) {
-                    game.gravity_tick();
+                // Always advance the clear animation; this can spawn the next piece.
+                if game.step_clear_animation() {
                     last_tick = Instant::now();
                 }
-                game.check_lock_delay();
+                if !game.is_animating() {
+                    if input.arr_enabled {
+                        let das = Duration::from_millis(DAS_MS);
+                        let arr = Duration::from_millis(ARR_MS);
+                        let sdr = Duration::from_millis(SDR_MS);
+                        let left_n = input.left.tick(das, arr);
+                        for _ in 0..left_n {
+                            if !game.try_move(0, -1) {
+                                break;
+                            }
+                        }
+                        let right_n = input.right.tick(das, arr);
+                        for _ in 0..right_n {
+                            if !game.try_move(0, 1) {
+                                break;
+                            }
+                        }
+                        let down_n = input.down.tick(sdr, sdr);
+                        if down_n > 0 {
+                            for _ in 0..down_n {
+                                game.soft_drop();
+                            }
+                            last_tick = Instant::now();
+                        }
+                    }
+                    if last_tick.elapsed() >= Duration::from_millis(game.gravity_ms()) {
+                        game.gravity_tick();
+                        last_tick = Instant::now();
+                    }
+                    game.check_lock_delay();
+                }
             }
         }
         Ok(())
@@ -1339,21 +1463,81 @@ mod tests {
         let mut game = Game::new(Mode::Marathon, 0);
         game.level = 1;
         game.apply_score(TSpinType::None, 1);
+        // single, no combo bonus yet
         assert_eq!(game.score, 100);
         game.apply_score(TSpinType::None, 4);
-        assert_eq!(game.score, 100 + 800);
+        // tetris (800) + combo x2 bonus (50)
+        assert_eq!(game.score, 100 + 800 + 50);
     }
 
     #[test]
     fn scoring_tspin_bonuses() {
         let mut game = Game::new(Mode::Marathon, 0);
         game.level = 1;
+        // No-line T-Spin: 400 base, no combo (cleared==0), no b2b update
         game.apply_score(TSpinType::Full, 0);
         assert_eq!(game.score, 400);
+        // T-Spin Double: 1200 base, first difficult clear with lines → no B2B multiplier
+        // yet (b2b_active was false). combo becomes 0, no bonus.
         game.apply_score(TSpinType::Full, 2);
         assert_eq!(game.score, 400 + 1200);
+        // T-Spin Mini Single: B2B chains (×1.5 → 300) + combo x2 (+50)
         game.apply_score(TSpinType::Mini, 1);
-        assert_eq!(game.score, 1600 + 200);
+        assert_eq!(game.score, 1600 + 300 + 50);
+    }
+
+    #[test]
+    fn b2b_tetris_chain_applies_multiplier() {
+        let mut game = Game::new(Mode::Marathon, 0);
+        game.level = 1;
+        game.apply_score(TSpinType::None, 4);
+        assert_eq!(game.score, 800);
+        assert!(game.b2b_active);
+        // Second tetris: 800 × 1.5 = 1200 base + combo x2 (+50)
+        game.apply_score(TSpinType::None, 4);
+        assert_eq!(game.score, 800 + 1200 + 50);
+    }
+
+    #[test]
+    fn b2b_broken_by_non_difficult_clear() {
+        let mut game = Game::new(Mode::Marathon, 0);
+        game.apply_score(TSpinType::None, 4);
+        assert!(game.b2b_active);
+        game.apply_score(TSpinType::None, 1);
+        assert!(!game.b2b_active);
+    }
+
+    #[test]
+    fn b2b_maintained_through_no_clear() {
+        let mut game = Game::new(Mode::Marathon, 0);
+        game.apply_score(TSpinType::None, 4);
+        assert!(game.b2b_active);
+        game.apply_score(TSpinType::None, 0);
+        assert!(game.b2b_active, "no-clear lock must NOT break B2B");
+        assert_eq!(game.combo, -1, "no-clear lock resets combo");
+    }
+
+    #[test]
+    fn combo_advances_and_resets() {
+        let mut game = Game::new(Mode::Marathon, 0);
+        game.apply_score(TSpinType::None, 1);
+        assert_eq!(game.combo, 0);
+        game.apply_score(TSpinType::None, 2);
+        assert_eq!(game.combo, 1);
+        game.apply_score(TSpinType::None, 0);
+        assert_eq!(game.combo, -1);
+    }
+
+    #[test]
+    fn full_rows_and_collapse_rows() {
+        let mut game = Game::new(Mode::Marathon, 0);
+        for c in 0..WIDTH {
+            game.board[HEIGHT - 1][c] = Some(Color::Red);
+        }
+        let rows = game.full_rows();
+        assert_eq!(rows, vec![HEIGHT - 1]);
+        game.collapse_rows(&rows);
+        assert!(game.board[HEIGHT - 1].iter().all(|c| c.is_none()));
     }
 
     #[test]
